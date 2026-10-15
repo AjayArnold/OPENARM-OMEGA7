@@ -1,0 +1,311 @@
+#include <algorithm>
+#include <chrono>
+#include <cmath>
+#include <memory>
+
+#include "rclcpp/rclcpp.hpp"
+#include "geometry_msgs/msg/pose_stamped.hpp"
+#include "geometry_msgs/msg/twist_stamped.hpp"
+#include "trajectory_msgs/msg/joint_trajectory.hpp"
+#include "trajectory_msgs/msg/joint_trajectory_point.hpp"
+#include "tf2/LinearMath/Quaternion.h"
+#include "tf2_geometry_msgs/tf2_geometry_msgs.hpp"
+#include "tf2_ros/buffer.h"
+#include "tf2_ros/transform_listener.h"
+#include "std_msgs/msg/float64.hpp"
+#include "std_msgs/msg/int8.hpp"
+#include "std_srvs/srv/trigger.hpp"
+
+using std::placeholders::_1;
+
+class OmegaTeleop : public rclcpp::Node
+{
+public:
+    OmegaTeleop() : Node("omega7_teleop")
+    {
+        omega_sub_ = create_subscription<geometry_msgs::msg::PoseStamped>(
+            "/omega/pose", 10,
+            std::bind(&OmegaTeleop::omegaCallback, this, _1));
+
+        gripper_sub_ = create_subscription<std_msgs::msg::Float64>(
+            "/omega/gripper", 10,
+            std::bind(&OmegaTeleop::gripperCallback, this, _1));
+
+        status_sub_ = create_subscription<std_msgs::msg::Int8>(
+            "/servo_node/status", 10,
+            std::bind(&OmegaTeleop::statusCallback, this, _1));
+
+        twist_pub_ = create_publisher<geometry_msgs::msg::TwistStamped>(
+            "/servo_node/delta_twist_cmds", rclcpp::SystemDefaultsQoS());
+
+        gripper_pub_ =
+            create_publisher<trajectory_msgs::msg::JointTrajectory>(
+                "/right_gripper_controller/joint_trajectory", 10);
+
+        tf_buffer_ = std::make_shared<tf2_ros::Buffer>(this->get_clock());
+        tf_listener_ =
+            std::make_shared<tf2_ros::TransformListener>(*tf_buffer_);
+
+        start_servo_client_ =
+            create_client<std_srvs::srv::Trigger>("/servo_node/start_servo");
+
+        RCLCPP_INFO(get_logger(), "Waiting for /servo_node/start_servo...");
+        while (!start_servo_client_->wait_for_service(std::chrono::seconds(1))) {
+            RCLCPP_INFO(get_logger(), "Still waiting for moveit_servo...");
+        }
+
+        auto req = std::make_shared<std_srvs::srv::Trigger::Request>();
+        start_servo_client_->async_send_request(
+            req,
+            [this](rclcpp::Client<std_srvs::srv::Trigger>::SharedFuture future) {
+                auto res = future.get();
+                RCLCPP_INFO(
+                    get_logger(), "start_servo -> success=%d msg=%s",
+                    res->success, res->message.c_str());
+            });
+
+        timer_ = create_wall_timer(
+            std::chrono::milliseconds(40),
+            std::bind(&OmegaTeleop::controlLoop, this));
+
+        RCLCPP_INFO(
+            get_logger(),
+            "Ready. Hold Omega near centre. First pose becomes reference.");
+    }
+
+private:
+    void omegaCallback(const geometry_msgs::msg::PoseStamped::SharedPtr msg)
+    {
+        latest_omega_pose_ = *msg;
+        have_omega_pose_ = true;
+
+        if (!reference_set_) {
+            omega_x0_ = msg->pose.position.x;
+            omega_y0_ = msg->pose.position.y;
+            omega_z0_ = msg->pose.position.z;
+
+            tf2::fromMsg(msg->pose.orientation, omega_q0_);
+            omega_q0_.normalize();
+            prev_omega_q_ = omega_q0_;
+
+            reference_set_ = true;
+
+            RCLCPP_INFO(
+                get_logger(), "Reference Omega position: %.3f %.3f %.3f",
+                omega_x0_, omega_y0_, omega_z0_);
+        }
+    }
+
+    void statusCallback(const std_msgs::msg::Int8::SharedPtr msg)
+    {
+        servo_status_ = msg->data;
+    }
+
+    void gripperCallback(const std_msgs::msg::Float64::SharedPtr msg)
+    {
+        constexpr double omega_open = 0.026;
+        constexpr double omega_closed = 0.000;
+        constexpr double openarm_open = 0.044;
+        constexpr double openarm_closed = 0.0;
+
+        double omega_value = std::clamp(msg->data, omega_closed, omega_open);
+        double open_fraction =
+            (omega_value - omega_closed) / (omega_open - omega_closed);
+        double openarm_position =
+            openarm_closed - open_fraction * (openarm_closed - openarm_open);
+
+        trajectory_msgs::msg::JointTrajectory command;
+        command.joint_names = {"openarm_right_finger_joint1"};
+
+        trajectory_msgs::msg::JointTrajectoryPoint point;
+        point.positions = {openarm_position};
+        point.time_from_start.sec = 0;
+        point.time_from_start.nanosec = 0;
+        command.points.push_back(point);
+
+        gripper_pub_->publish(command);
+    }
+
+    void controlLoop()
+    {
+        if (!have_omega_pose_ || !reference_set_) {
+            return;
+        }
+
+        geometry_msgs::msg::TransformStamped ee_tf;
+        try {
+            ee_tf = tf_buffer_->lookupTransform(
+                planning_frame_, ee_frame_, tf2::TimePointZero);
+        } catch (const tf2::TransformException &ex) {
+            RCLCPP_WARN_THROTTLE(
+                get_logger(), *get_clock(), 1000,
+                "TF lookup %s -> %s failed: %s",
+                planning_frame_.c_str(), ee_frame_.c_str(), ex.what());
+            return;
+        }
+
+        if (!arm_reference_set_) {
+            openarm_x0_ = ee_tf.transform.translation.x;
+            openarm_y0_ = ee_tf.transform.translation.y;
+            openarm_z0_ = ee_tf.transform.translation.z;
+
+            tf2::fromMsg(ee_tf.transform.rotation, target_q_);
+            target_q_.normalize();
+            target_q0_ = target_q_;
+            omega_x0_ = latest_omega_pose_.pose.position.x;
+            omega_y0_ = latest_omega_pose_.pose.position.y;
+            omega_z0_ = latest_omega_pose_.pose.position.z;
+            tf2::fromMsg(latest_omega_pose_.pose.orientation, omega_q0_);
+            omega_q0_.normalize();
+
+            arm_reference_set_ = true;
+
+            RCLCPP_INFO(
+                get_logger(),
+                "Arm reference pose captured: %.3f %.3f %.3f",
+                openarm_x0_, openarm_y0_, openarm_z0_);
+            return;
+        }
+
+        if (servo_status_ != 0) {
+            omega_x0_ = latest_omega_pose_.pose.position.x;
+            omega_y0_ = latest_omega_pose_.pose.position.y;
+            omega_z0_ = latest_omega_pose_.pose.position.z;
+            tf2::fromMsg(latest_omega_pose_.pose.orientation, omega_q0_);
+            omega_q0_.normalize();
+
+            openarm_x0_ = ee_tf.transform.translation.x;
+            openarm_y0_ = ee_tf.transform.translation.y;
+            openarm_z0_ = ee_tf.transform.translation.z;
+            tf2::fromMsg(ee_tf.transform.rotation, target_q_);
+            target_q_.normalize();
+            target_q0_ = target_q_;
+
+            RCLCPP_WARN_THROTTLE(
+                get_logger(), *get_clock(), 1000,
+                "Servo status=%d - re-anchoring.",
+                servo_status_);
+        }
+
+        double dx = latest_omega_pose_.pose.position.x - omega_x0_;
+        double dy = latest_omega_pose_.pose.position.y - omega_y0_;
+        double dz = latest_omega_pose_.pose.position.z - omega_z0_;
+
+        constexpr double max_displacement = 0.05;
+        dx = std::clamp(dx, -max_displacement, max_displacement);
+        dy = std::clamp(dy, -max_displacement, max_displacement);
+        dz = std::clamp(dz, -max_displacement, max_displacement);
+
+        constexpr double scale = 1.0;
+        const double target_x = openarm_x0_ + scale * dx;
+        const double target_y = openarm_y0_ + scale * dy;
+        const double target_z = openarm_z0_ + scale * dz;
+
+        tf2::Quaternion omega_q;
+        tf2::fromMsg(latest_omega_pose_.pose.orientation, omega_q);
+        omega_q.normalize();
+
+        tf2::Quaternion delta_q = omega_q0_.inverse() * omega_q;
+        delta_q.normalize();
+
+        target_q_ = delta_q * target_q0_;
+        target_q_.normalize();
+
+
+        double ex = target_x - ee_tf.transform.translation.x;
+        double ey = target_y - ee_tf.transform.translation.y;
+        double ez = target_z - ee_tf.transform.translation.z;
+
+        constexpr double kp_lin = 2.0;
+        constexpr double max_lin_vel = 0.1;
+
+        double vx = std::clamp(kp_lin * ex, -max_lin_vel, max_lin_vel);
+        double vy = std::clamp(kp_lin * ey, -max_lin_vel, max_lin_vel);
+        double vz = std::clamp(kp_lin * ez, -max_lin_vel, max_lin_vel);
+
+        tf2::Quaternion current_q;
+        tf2::fromMsg(ee_tf.transform.rotation, current_q);
+        current_q.normalize();
+
+        tf2::Quaternion q_err = target_q_ * current_q.inverse();
+        q_err.normalize();
+
+        if (q_err.getW() < 0.0) {
+            q_err = tf2::Quaternion(
+                -q_err.getX(), -q_err.getY(), -q_err.getZ(), -q_err.getW());
+        }
+
+        constexpr double kp_ang = 3.0;
+        constexpr double max_ang_vel = 1.0;
+
+        double wx = std::clamp(kp_ang * 2.0 * q_err.getX(), -max_ang_vel, max_ang_vel);
+        double wy = std::clamp(kp_ang * 2.0 * q_err.getY(), -max_ang_vel, max_ang_vel);
+        double wz = std::clamp(kp_ang * 2.0 * q_err.getZ(), -max_ang_vel, max_ang_vel);
+
+        geometry_msgs::msg::TwistStamped twist;
+        twist.header.stamp = now();
+        twist.header.frame_id = planning_frame_;
+        twist.twist.linear.x = vx;
+        twist.twist.linear.y = vy;
+        twist.twist.linear.z = vz;
+        twist.twist.angular.x = wx;
+        twist.twist.angular.y = wy;
+        twist.twist.angular.z = wz;
+
+        twist_pub_->publish(twist);
+
+        // DIAGNOSTIC: target vs actual, every cycle, unthrottled, in
+        // this one already-reliable terminal - no second log file,
+        // no timestamp correlation needed.
+        RCLCPP_INFO(
+            get_logger(),
+            "target[%.3f %.3f %.3f] actual[%.3f %.3f %.3f] err[%.3f %.3f %.3f] twist[%.3f %.3f %.3f] ang[%.3f %.3f %.3f] qerr[%.3f %.3f %.3f %.3f]",
+            target_x, target_y, target_z,
+            ee_tf.transform.translation.x, ee_tf.transform.translation.y, ee_tf.transform.translation.z,
+            ex, ey, ez, vx, vy, vz,
+            wx, wy, wz,
+            q_err.getX(), q_err.getY(), q_err.getZ(), q_err.getW());
+    }
+
+    rclcpp::Subscription<geometry_msgs::msg::PoseStamped>::SharedPtr omega_sub_;
+    rclcpp::Subscription<std_msgs::msg::Float64>::SharedPtr gripper_sub_;
+    rclcpp::Subscription<std_msgs::msg::Int8>::SharedPtr status_sub_;
+    rclcpp::Publisher<geometry_msgs::msg::TwistStamped>::SharedPtr twist_pub_;
+    rclcpp::Publisher<trajectory_msgs::msg::JointTrajectory>::SharedPtr gripper_pub_;
+    rclcpp::Client<std_srvs::srv::Trigger>::SharedPtr start_servo_client_;
+    rclcpp::TimerBase::SharedPtr timer_;
+
+    std::shared_ptr<tf2_ros::Buffer> tf_buffer_;
+    std::shared_ptr<tf2_ros::TransformListener> tf_listener_;
+
+    const std::string planning_frame_ = "world";
+    const std::string ee_frame_ = "openarm_right_hand";
+
+    geometry_msgs::msg::PoseStamped latest_omega_pose_;
+    bool have_omega_pose_{false};
+    bool reference_set_{false};
+    bool arm_reference_set_{false};
+    int8_t servo_status_{0};
+
+    double omega_x0_{0.0};
+    double omega_y0_{0.0};
+    double omega_z0_{0.0};
+
+    double openarm_x0_{0.0};
+    double openarm_y0_{0.0};
+    double openarm_z0_{0.0};
+
+    tf2::Quaternion omega_q0_;
+    tf2::Quaternion prev_omega_q_;
+    tf2::Quaternion target_q_;
+    tf2::Quaternion target_q0_;
+};
+
+int main(int argc, char **argv)
+{
+    rclcpp::init(argc, argv);
+    auto node = std::make_shared<OmegaTeleop>();
+    rclcpp::spin(node);
+    rclcpp::shutdown();
+    return 0;
+}
